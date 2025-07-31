@@ -15,46 +15,80 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from discord.ext import tasks
-from dotenv import load_dotenv
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables - try both methods
-load_dotenv()
+# Environment variables validation with better error messages
+def validate_environment():
+    """Validate required environment variables"""
+    logger.info("=== ENVIRONMENT VALIDATION ===")
+    
+    # Wait a moment for environment to be fully loaded (Railway timing issue)
+    time.sleep(1)
+    
+    # Get environment variables with multiple attempts
+    discord_token = None
+    voice_channel_id = None
+    
+    for attempt in range(3):
+        discord_token = os.environ.get("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
+        voice_channel_id = os.environ.get("VOICE_CHANNEL_ID") or os.getenv("VOICE_CHANNEL_ID")
+        
+        if discord_token and voice_channel_id:
+            break
+        
+        logger.warning(f"⚠️ Attempt {attempt + 1}: Some variables not found, retrying...")
+        time.sleep(2)
+    
+    # Debug ALL environment variables
+    logger.info("=== ALL ENVIRONMENT VARIABLES ===")
+    for key, value in sorted(os.environ.items()):
+        if any(keyword in key.upper() for keyword in ['TOKEN', 'BOT', 'DISCORD', 'CHANNEL', 'VOICE']):
+            # Show first 10 chars of sensitive values
+            display_value = f"{value[:10]}..." if len(value) > 10 and 'TOKEN' in key else value
+            logger.info(f"  {key} = {display_value}")
+    logger.info("=" * 40)
+    
+    # Validate Discord token
+    if not discord_token:
+        logger.error("❌ DISCORD_BOT_TOKEN is missing!")
+        logger.error("🔧 Variables found in Railway but not accessible:")
+        logger.error("   - Try redeploying the service")
+        logger.error("   - Check if variables are set at service level (not shared)")
+        logger.error("   - Verify the variable names match exactly")
+        raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
+    
+    # Validate voice channel ID
+    if not voice_channel_id:
+        logger.error("❌ VOICE_CHANNEL_ID is missing!")
+        logger.error("🔧 Variables found in Railway but not accessible:")
+        logger.error("   - Try redeploying the service")
+        logger.error("   - Check if variables are set at service level (not shared)")
+        logger.error("   - Verify the variable names match exactly")
+        raise ValueError("VOICE_CHANNEL_ID environment variable is required")
+    
+    # Validate channel ID format
+    try:
+        voice_channel_id = int(voice_channel_id)
+    except ValueError:
+        logger.error(f"❌ VOICE_CHANNEL_ID must be a valid integer. Got: '{voice_channel_id}'")
+        raise ValueError("VOICE_CHANNEL_ID must be a valid integer")
+    
+    logger.info("✅ Environment variables validated successfully")
+    logger.info(f"✅ Discord token: {discord_token[:10]}..." if len(discord_token) > 10 else "✅ Discord token: SET")
+    logger.info(f"✅ Voice channel ID: {voice_channel_id}")
+    
+    return discord_token, voice_channel_id
 
-# Debug environment variables
-logger.info("=== ENVIRONMENT DEBUG ===")
-logger.info(f"All env vars: {list(os.environ.keys())}")
-logger.info(f"TOKEN exists: {'DISCORD_BOT_TOKEN' in os.environ}")
-logger.info(f"CHANNEL exists: {'VOICE_CHANNEL_ID' in os.environ}")
-logger.info("=========================")
-
-# Fetch and validate environment variables
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN")
-VOICE_CHANNEL_ID = os.getenv("VOICE_CHANNEL_ID") or os.environ.get("VOICE_CHANNEL_ID")
-
-if not DISCORD_BOT_TOKEN:
-    logger.error("❌ DISCORD_BOT_TOKEN is not set in environment variables.")
-    logger.error("Available environment variables:")
-    for key in sorted(os.environ.keys()):
-        if 'TOKEN' in key or 'BOT' in key or 'DISCORD' in key:
-            logger.error(f"  {key}")
-    raise ValueError("❌ DISCORD_BOT_TOKEN is not set in environment variables.")
-
-if not VOICE_CHANNEL_ID:
-    logger.error("❌ VOICE_CHANNEL_ID is not set in environment variables.")
-    logger.error("Available environment variables:")
-    for key in sorted(os.environ.keys()):
-        if 'CHANNEL' in key or 'VOICE' in key:
-            logger.error(f"  {key}")
-    raise ValueError("❌ VOICE_CHANNEL_ID is not set in environment variables.")
-
+# Validate environment on import
 try:
-    VOICE_CHANNEL_ID = int(VOICE_CHANNEL_ID)
-except ValueError:
-    raise ValueError("❌ VOICE_CHANNEL_ID must be a valid integer.")
+    DISCORD_BOT_TOKEN, VOICE_CHANNEL_ID = validate_environment()
+except Exception as e:
+    logger.error(f"❌ Environment validation failed: {e}")
+    logger.error("❌ Bot cannot start without proper environment variables")
+    raise
 
 # Setup Discord client
 intents = discord.Intents.default()
@@ -66,6 +100,12 @@ last_price = None
 
 def find_chrome_binary():
     """Find Chrome/Chromium binary location"""
+    # Check if Railway provides a Chrome binary path
+    railway_chrome = os.environ.get("GOOGLE_CHROME_BIN")
+    if railway_chrome and os.path.exists(railway_chrome):
+        logger.info(f"✅ Found Railway Chrome binary: {railway_chrome}")
+        return railway_chrome
+    
     possible_paths = [
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
@@ -73,7 +113,8 @@ def find_chrome_binary():
         "/usr/bin/chromium-browser",
         "/snap/bin/chromium",
         "/usr/bin/chrome",
-        "/opt/google/chrome/google-chrome"
+        "/opt/google/chrome/google-chrome",
+        "/app/.chrome-for-testing/chrome-linux64/chrome"  # Railway buildpack location
     ]
     
     for path in possible_paths:
@@ -82,6 +123,8 @@ def find_chrome_binary():
             return path
     
     logger.error("❌ No Chrome binary found")
+    logger.error("🔧 For Railway deployment, make sure you have Chrome buildpack:")
+    logger.error("   Add this to your Railway service build settings or use a Chrome buildpack")
     return None
 
 def get_chrome_version(chrome_path):
@@ -110,6 +153,12 @@ def get_chrome_version(chrome_path):
 def download_compatible_chromedriver(major_version):
     """Download ChromeDriver compatible with Chrome version"""
     try:
+        # Check if Railway provides chromedriver path
+        railway_chromedriver = os.environ.get("CHROMEDRIVER_PATH")
+        if railway_chromedriver and os.path.exists(railway_chromedriver):
+            logger.info(f"✅ Using Railway ChromeDriver: {railway_chromedriver}")
+            return railway_chromedriver
+        
         # ChromeDriver directory
         driver_dir = "/tmp/chromedriver_new"
         driver_path = os.path.join(driver_dir, "chromedriver")
@@ -258,13 +307,13 @@ def setup_chromedriver_and_chrome():
         return None, None
 
 def create_chrome_options(chrome_binary):
-    """Create optimized Chrome options"""
+    """Create optimized Chrome options for Railway deployment"""
     options = Options()
     
     # Set binary location
     options.binary_location = chrome_binary
     
-    # Essential options for headless operation
+    # Essential options for headless operation in containerized environment
     options.add_argument("--headless=new")  # Use new headless mode
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -274,7 +323,9 @@ def create_chrome_options(chrome_binary):
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--remote-debugging-port=9222")
     
-    # Performance and stability
+    # Railway/Container specific options
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-background-timer-throttling")
     options.add_argument("--disable-backgrounding-occluded-windows")
     options.add_argument("--disable-renderer-backgrounding")
@@ -282,14 +333,13 @@ def create_chrome_options(chrome_binary):
     options.add_argument("--disable-features=VizDisplayCompositor")
     options.add_argument("--disable-ipc-flooding-protection")
     options.add_argument("--memory-pressure-off")
-    options.add_argument("--single-process")
     
-    # Reduce resource usage
-    options.add_argument("--disable-images")
-    options.add_argument("--disable-javascript")  # Only if the site works without JS
+    # Reduce resource usage for Railway
+    options.add_argument("--max_old_space_size=4096")
     options.add_argument("--disable-logging")
     options.add_argument("--disable-dev-tools")
     options.add_argument("--log-level=3")
+    options.add_argument("--silent")
     
     # Anti-detection measures
     options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
@@ -534,15 +584,14 @@ def main():
     logger.info("🚀 prANA Price Bot Starting...")
     logger.info(f"🐍 Python: {os.sys.version}")
     logger.info(f"📁 Working dir: {os.getcwd()}")
+    logger.info(f"🚂 Platform: Railway" if "RAILWAY_ENVIRONMENT" in os.environ else "🖥️ Platform: Local")
     
-    # Validate environment
-    if DISCORD_BOT_TOKEN:
-        logger.info("✅ Discord token configured")
-    if VOICE_CHANNEL_ID:
-        logger.info(f"✅ Channel ID: {VOICE_CHANNEL_ID}")
+    # Environment is already validated during import
+    logger.info("✅ Environment validation passed")
     
     # Start bot
     try:
+        logger.info("🤖 Starting Discord bot...")
         client.run(DISCORD_BOT_TOKEN)
     except KeyboardInterrupt:
         logger.info("👋 Bot stopped by user")
