@@ -545,8 +545,8 @@ async def update_bot_status():
                 
                 # Update bot status
                 try:
-                    await client.change_presence(activity=discord.Game(name=f"prANA: ${price}"))
-                    logger.info(f"✅ Bot status updated: prANA: ${price}")
+                    await client.change_presence(activity=discord.Game(name=f"📊prANA Price: ${price}"))
+                    logger.info(f"✅ Bot status updated: 📊prANA Price: ${price}")
                 except Exception as status_error:
                     logger.error(f"❌ Status update failed: {status_error}")
                 
@@ -554,7 +554,7 @@ async def update_bot_status():
                 channel = client.get_channel(VOICE_CHANNEL_ID)
                 if channel and isinstance(channel, discord.VoiceChannel):
                     try:
-                        channel_name = f"prANA: ${price}"
+                        channel_name = f"📊prANA Price: ${price}"
                         await channel.edit(name=channel_name)
                         logger.info(f"🔁 Channel updated: {channel_name}")
                         last_price = price
