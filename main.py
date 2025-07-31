@@ -21,16 +21,34 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
+# Load environment variables - try both methods
 load_dotenv()
 
+# Debug environment variables
+logger.info("=== ENVIRONMENT DEBUG ===")
+logger.info(f"All env vars: {list(os.environ.keys())}")
+logger.info(f"TOKEN exists: {'DISCORD_BOT_TOKEN' in os.environ}")
+logger.info(f"CHANNEL exists: {'VOICE_CHANNEL_ID' in os.environ}")
+logger.info("=========================")
+
 # Fetch and validate environment variables
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-VOICE_CHANNEL_ID = os.getenv("VOICE_CHANNEL_ID")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN") or os.environ.get("DISCORD_BOT_TOKEN")
+VOICE_CHANNEL_ID = os.getenv("VOICE_CHANNEL_ID") or os.environ.get("VOICE_CHANNEL_ID")
 
 if not DISCORD_BOT_TOKEN:
+    logger.error("❌ DISCORD_BOT_TOKEN is not set in environment variables.")
+    logger.error("Available environment variables:")
+    for key in sorted(os.environ.keys()):
+        if 'TOKEN' in key or 'BOT' in key or 'DISCORD' in key:
+            logger.error(f"  {key}")
     raise ValueError("❌ DISCORD_BOT_TOKEN is not set in environment variables.")
+
 if not VOICE_CHANNEL_ID:
+    logger.error("❌ VOICE_CHANNEL_ID is not set in environment variables.")
+    logger.error("Available environment variables:")
+    for key in sorted(os.environ.keys()):
+        if 'CHANNEL' in key or 'VOICE' in key:
+            logger.error(f"  {key}")
     raise ValueError("❌ VOICE_CHANNEL_ID is not set in environment variables.")
 
 try:
