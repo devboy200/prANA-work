@@ -20,53 +20,90 @@ from discord.ext import tasks
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Environment variables validation with better error messages
+# Environment variables validation with comprehensive debugging
 def validate_environment():
     """Validate required environment variables"""
-    logger.info("=== ENVIRONMENT VALIDATION ===")
+    logger.info("=== COMPREHENSIVE ENVIRONMENT DEBUG ===")
     
-    # Wait a moment for environment to be fully loaded (Railway timing issue)
-    time.sleep(1)
+    # Print ALL environment variables for debugging
+    logger.info("ALL ENVIRONMENT VARIABLES:")
+    env_vars = dict(os.environ)
+    for key in sorted(env_vars.keys()):
+        value = env_vars[key]
+        # Hide sensitive values but show they exist
+        if 'TOKEN' in key.upper() or 'SECRET' in key.upper() or 'KEY' in key.upper():
+            display_value = f"***HIDDEN*** (length: {len(value)})"
+        else:
+            display_value = value
+        logger.info(f"  {key} = {display_value}")
     
-    # Get environment variables with multiple attempts
+    logger.info("=" * 50)
+    
+    # Multiple methods to get variables
+    methods = [
+        ("os.environ.get", lambda k: os.environ.get(k)),
+        ("os.getenv", lambda k: os.getenv(k)),
+        ("direct os.environ", lambda k: os.environ[k] if k in os.environ else None),
+    ]
+    
     discord_token = None
     voice_channel_id = None
     
-    for attempt in range(3):
-        discord_token = os.environ.get("DISCORD_BOT_TOKEN") or os.getenv("DISCORD_BOT_TOKEN")
-        voice_channel_id = os.environ.get("VOICE_CHANNEL_ID") or os.getenv("VOICE_CHANNEL_ID")
-        
-        if discord_token and voice_channel_id:
-            break
-        
-        logger.warning(f"⚠️ Attempt {attempt + 1}: Some variables not found, retrying...")
-        time.sleep(2)
+    for method_name, method_func in methods:
+        logger.info(f"Trying {method_name}:")
+        try:
+            token = method_func("DISCORD_BOT_TOKEN")
+            channel = method_func("VOICE_CHANNEL_ID")
+            logger.info(f"  DISCORD_BOT_TOKEN: {'FOUND' if token else 'NOT FOUND'}")
+            logger.info(f"  VOICE_CHANNEL_ID: {'FOUND' if channel else 'NOT FOUND'}")
+            
+            if token and not discord_token:
+                discord_token = token
+            if channel and not voice_channel_id:
+                voice_channel_id = channel
+                
+        except Exception as e:
+            logger.error(f"  Error with {method_name}: {e}")
     
-    # Debug ALL environment variables
-    logger.info("=== ALL ENVIRONMENT VARIABLES ===")
-    for key, value in sorted(os.environ.items()):
-        if any(keyword in key.upper() for keyword in ['TOKEN', 'BOT', 'DISCORD', 'CHANNEL', 'VOICE']):
-            # Show first 10 chars of sensitive values
-            display_value = f"{value[:10]}..." if len(value) > 10 and 'TOKEN' in key else value
-            logger.info(f"  {key} = {display_value}")
-    logger.info("=" * 40)
+    # Try reading from potential Railway config files
+    potential_files = [
+        "/app/.env",
+        "/etc/environment",
+        "/proc/self/environ"
+    ]
     
-    # Validate Discord token
+    for file_path in potential_files:
+        if os.path.exists(file_path):
+            logger.info(f"Found config file: {file_path}")
+            try:
+                with open(file_path, 'r') as f:
+                    content = f.read()
+                    if 'DISCORD_BOT_TOKEN' in content:
+                        logger.info(f"  DISCORD_BOT_TOKEN found in {file_path}")
+                    if 'VOICE_CHANNEL_ID' in content:
+                        logger.info(f"  VOICE_CHANNEL_ID found in {file_path}")
+            except Exception as e:
+                logger.warning(f"  Could not read {file_path}: {e}")
+    
+    # Final validation
     if not discord_token:
-        logger.error("❌ DISCORD_BOT_TOKEN is missing!")
-        logger.error("🔧 Variables found in Railway but not accessible:")
-        logger.error("   - Try redeploying the service")
-        logger.error("   - Check if variables are set at service level (not shared)")
-        logger.error("   - Verify the variable names match exactly")
+        logger.error("❌ DISCORD_BOT_TOKEN could not be found with any method!")
+        logger.error("🔧 DEBUG STEPS:")
+        logger.error("   1. Check if Railway variables are really set")
+        logger.error("   2. Try deleting and re-adding the variables")
+        logger.error("   3. Make sure you're deploying to the right service/environment")
+        logger.error("   4. Check Railway documentation for environment variable issues")
+        
+        # Last resort: try to find any variable that might be the token
+        logger.info("🔍 Searching for potential token variables:")
+        for key, value in os.environ.items():
+            if len(value) > 50 and ('.' in value or len(value) > 60):  # Token-like pattern
+                logger.info(f"  Potential token found in {key} (length: {len(value)})")
+        
         raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
     
-    # Validate voice channel ID
     if not voice_channel_id:
-        logger.error("❌ VOICE_CHANNEL_ID is missing!")
-        logger.error("🔧 Variables found in Railway but not accessible:")
-        logger.error("   - Try redeploying the service")
-        logger.error("   - Check if variables are set at service level (not shared)")
-        logger.error("   - Verify the variable names match exactly")
+        logger.error("❌ VOICE_CHANNEL_ID could not be found with any method!")
         raise ValueError("VOICE_CHANNEL_ID environment variable is required")
     
     # Validate channel ID format
@@ -77,7 +114,7 @@ def validate_environment():
         raise ValueError("VOICE_CHANNEL_ID must be a valid integer")
     
     logger.info("✅ Environment variables validated successfully")
-    logger.info(f"✅ Discord token: {discord_token[:10]}..." if len(discord_token) > 10 else "✅ Discord token: SET")
+    logger.info(f"✅ Discord token: {discord_token[:10]}...{discord_token[-4:]} (length: {len(discord_token)})")
     logger.info(f"✅ Voice channel ID: {voice_channel_id}")
     
     return discord_token, voice_channel_id
