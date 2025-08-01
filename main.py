@@ -8,12 +8,14 @@ import requests
 import zipfile
 import stat
 import shutil
+import random
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException, NoSuchElementException
 from discord.ext import tasks
 
 # Setup logging
@@ -134,6 +136,7 @@ intents.voice_states = True
 client = discord.Client(intents=intents)
 
 last_price = None
+fetch_stats = {"success": 0, "failures": 0, "consecutive_failures": 0}
 
 def find_chrome_binary():
     """Find Chrome/Chromium binary location"""
@@ -343,7 +346,7 @@ def setup_chromedriver_and_chrome():
         logger.error(f"❌ ChromeDriver setup error: {e}")
         return None, None
 
-def create_chrome_options(chrome_binary):
+def create_chrome_options(chrome_binary, user_agent_variant=None):
     """Create optimized Chrome options for Railway deployment"""
     options = Options()
     
@@ -378,27 +381,86 @@ def create_chrome_options(chrome_binary):
     options.add_argument("--log-level=3")
     options.add_argument("--silent")
     
-    # Anti-detection measures
-    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+    # Anti-detection measures with optional user agent variation
+    user_agents = [
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    ]
+    
+    if user_agent_variant is not None and user_agent_variant < len(user_agents):
+        selected_ua = user_agents[user_agent_variant]
+    else:
+        selected_ua = random.choice(user_agents)
+    
+    options.add_argument(f"--user-agent={selected_ua}")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
     
     return options
 
-def fetch_price():
-    """Fetch prANA price from Nirvana Finance"""
+def wait_for_page_load(driver, timeout=180):
+    """Wait for JavaScript to complete and page to be fully loaded"""
+    try:
+        logger.info("⏳ Waiting for page to fully load...")
+        
+        # Wait for document ready state
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        
+        # Wait for jQuery if it exists
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return typeof jQuery === 'undefined' || jQuery.active === 0")
+            )
+            logger.info("✅ jQuery operations completed")
+        except TimeoutException:
+            logger.info("ℹ️ No jQuery detected or still active")
+        
+        # Wait for React/Angular if they exist
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("""
+                    return (typeof React === 'undefined' || 
+                           typeof angular === 'undefined' || 
+                           (window.getAllAngularTestabilities && 
+                            window.getAllAngularTestabilities().findIndex(x=>!x.isStable()) === -1))
+                """)
+            )
+            logger.info("✅ React/Angular operations completed")
+        except TimeoutException:
+            logger.info("ℹ️ React/Angular still processing or not detected")
+        
+        # Additional wait for dynamic content
+        time.sleep(10)
+        logger.info("✅ Page load verification completed")
+        return True
+        
+    except TimeoutException:
+        logger.warning(f"⚠️ Page load timeout after {timeout}s, continuing anyway...")
+        return False
+    except Exception as e:
+        logger.warning(f"⚠️ Page load verification error: {e}")
+        return False
+
+def fetch_price_attempt(attempt_num=1, max_attempts=3):
+    """Single attempt to fetch price with comprehensive error handling"""
     driver = None
     
     try:
+        logger.info(f"🔄 Price fetch attempt {attempt_num}/{max_attempts}")
+        
         # Setup ChromeDriver and Chrome
         chromedriver_path, chrome_binary = setup_chromedriver_and_chrome()
         if not chromedriver_path or not chrome_binary:
             logger.error("❌ Chrome/ChromeDriver setup failed")
             return None
         
-        # Create Chrome options
-        options = create_chrome_options(chrome_binary)
+        # Create Chrome options with slight variations for retry attempts
+        user_agent_variant = (attempt_num - 1) % 3  # Rotate user agents
+        options = create_chrome_options(chrome_binary, user_agent_variant)
         
         # Create service
         service = Service(executable_path=chromedriver_path)
@@ -407,16 +469,20 @@ def fetch_price():
         logger.info("🚀 Starting Chrome WebDriver...")
         driver = webdriver.Chrome(service=service, options=options)
         
-        # Set timeouts
-        driver.set_page_load_timeout(90)
+        # Set increased timeouts for better reliability
+        driver.set_page_load_timeout(180)  # Increased from 90 to 180 seconds
         driver.implicitly_wait(30)
         
         logger.info("🌐 Loading Nirvana Finance realize page...")
         driver.get("https://mainnet.nirvana.finance/realize")
         
-        # Wait for page load
-        logger.info("⏳ Waiting for page elements...")
-        wait = WebDriverWait(driver, 90)
+        # Comprehensive page load waiting
+        if not wait_for_page_load(driver, timeout=180):
+            logger.warning("⚠️ Page load verification failed but continuing...")
+        
+        # Wait for page elements with extended timeout
+        logger.info("⏳ Waiting for price elements...")
+        wait = WebDriverWait(driver, 120)  # Increased from 90 to 120 seconds
         
         # Try multiple selectors to find the price
         selectors_to_try = [
@@ -428,6 +494,8 @@ def fetch_price():
             ("CSS_SELECTOR", "[class*='price']"),
             ("XPATH", "//span[contains(@class, 'DataPoint')]"),
             ("XPATH", "//div[contains(@class, 'DataPoint')]//span"),
+            ("XPATH", "//span[contains(text(), '$')]"),
+            ("XPATH", "//div[contains(text(), 'USDC')]"),
         ]
         
         price_text = None
@@ -437,6 +505,7 @@ def fetch_price():
             try:
                 logger.info(f"🔍 Trying {selector_type}: {selector}")
                 
+                # Use presence_of_element_located with extended wait
                 if selector_type == "CLASS_NAME":
                     element = wait.until(EC.presence_of_element_located((By.CLASS_NAME, selector)))
                 elif selector_type == "CSS_SELECTOR":
@@ -444,17 +513,26 @@ def fetch_price():
                 elif selector_type == "XPATH":
                     element = wait.until(EC.presence_of_element_located((By.XPATH, selector)))
                 
-                # Wait a bit more for dynamic content
-                time.sleep(5)
+                # Wait for element to be visible and have text
+                WebDriverWait(driver, 30).until(EC.visibility_of(element))
+                
+                # Additional wait for dynamic content
+                time.sleep(10)
                 
                 # Get text content
                 price_text = element.text.strip()
                 logger.info(f"📝 Found text with {selector_type} '{selector}': '{price_text}'")
                 
-                if price_text:
+                if price_text and len(price_text) > 0:
                     successful_selector = f"{selector_type}: {selector}"
                     break
                     
+            except TimeoutException:
+                logger.debug(f"⏰ {selector_type} '{selector}' timed out")
+                continue
+            except NoSuchElementException:
+                logger.debug(f"🔍 {selector_type} '{selector}' element not found")
+                continue
             except Exception as e:
                 logger.debug(f"⚠️ {selector_type} '{selector}' failed: {e}")
                 continue
@@ -484,12 +562,8 @@ def fetch_price():
         else:
             logger.warning("⚠️ No price found with any selector")
             
-            # Debug: take screenshot and log page info
+            # Enhanced debug information (skip screenshot to avoid timeout issues)
             try:
-                screenshot_path = "/tmp/debug_screenshot.png"
-                driver.save_screenshot(screenshot_path)
-                logger.info(f"📸 Debug screenshot: {screenshot_path}")
-                
                 # Check if page loaded correctly
                 page_title = driver.title
                 current_url = driver.current_url
@@ -502,16 +576,32 @@ def fetch_price():
                 # Look for any DataPoint mentions in source
                 if "DataPoint" in driver.page_source:
                     logger.info("✅ Found 'DataPoint' in page source")
+                    # Count occurrences
+                    datapoint_count = driver.page_source.count("DataPoint")
+                    logger.info(f"📊 DataPoint occurrences: {datapoint_count}")
                 else:
                     logger.warning("⚠️ No 'DataPoint' found in page source")
+                
+                # Check for other potential price indicators
+                price_indicators = ["$", "USDC", "price", "Price"]
+                for indicator in price_indicators:
+                    if indicator in driver.page_source:
+                        count = driver.page_source.count(indicator)
+                        logger.info(f"💰 Found '{indicator}' {count} times in page source")
                 
             except Exception as debug_error:
                 logger.warning(f"⚠️ Debug info failed: {debug_error}")
             
             return None
             
+    except TimeoutException as e:
+        logger.error(f"⏰ Timeout in attempt {attempt_num}: {str(e)}")
+        return None
+    except WebDriverException as e:
+        logger.error(f"🌐 WebDriver error in attempt {attempt_num}: {str(e)}")
+        return None
     except Exception as e:
-        logger.error(f"❌ Price fetch failed: {str(e)}")
+        logger.error(f"❌ Unexpected error in attempt {attempt_num}: {str(e)}")
         logger.error(f"❌ Error type: {type(e).__name__}")
         return None
         
@@ -519,13 +609,74 @@ def fetch_price():
         if driver:
             try:
                 driver.quit()
-                logger.info("🔄 Chrome WebDriver closed")
+                logger.info(f"🔄 Chrome WebDriver closed (attempt {attempt_num})")
             except Exception as close_error:
                 logger.warning(f"⚠️ Error closing WebDriver: {close_error}")
 
-@tasks.loop(seconds=120)  # Every 2 minutes
+def fetch_price():
+    """Fetch prANA price with retry logic and fallback strategies"""
+    global fetch_stats
+    
+    max_attempts = 3
+    base_delay = 30  # Base delay between attempts
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            logger.info(f"🎯 Starting price fetch attempt {attempt}/{max_attempts}")
+            
+            # Add random delay to avoid being too predictable
+            if attempt > 1:
+                delay = base_delay + random.randint(10, 30)
+                logger.info(f"⏳ Waiting {delay} seconds before retry...")
+                time.sleep(delay)
+            
+            # Attempt to fetch price
+            price = fetch_price_attempt(attempt, max_attempts)
+            
+            if price:
+                logger.info(f"✅ Price fetch succeeded on attempt {attempt}")
+                fetch_stats["success"] += 1
+                fetch_stats["consecutive_failures"] = 0
+                return price
+            else:
+                logger.warning(f"❌ Price fetch failed on attempt {attempt}")
+                fetch_stats["failures"] += 1
+                fetch_stats["consecutive_failures"] += 1
+                
+                # If not the last attempt, continue to retry
+                if attempt < max_attempts:
+                    logger.info(f"🔄 Will retry... ({max_attempts - attempt} attempts remaining)")
+                    continue
+                else:
+                    logger.error(f"❌ All {max_attempts} attempts failed")
+                    break
+                    
+        except Exception as e:
+            logger.error(f"❌ Critical error in attempt {attempt}: {e}")
+            fetch_stats["failures"] += 1
+            fetch_stats["consecutive_failures"] += 1
+            
+            if attempt < max_attempts:
+                logger.info(f"🔄 Continuing to next attempt due to critical error...")
+                continue
+            else:
+                logger.error(f"❌ Critical error on final attempt")
+                break
+    
+    # Log statistics
+    total_attempts = fetch_stats["success"] + fetch_stats["failures"]
+    if total_attempts > 0:
+        success_rate = (fetch_stats["success"] / total_attempts) * 100
+        logger.info(f"📊 Fetch statistics - Success: {fetch_stats['success']}, "
+                   f"Failures: {fetch_stats['failures']}, "
+                   f"Success rate: {success_rate:.1f}%, "
+                   f"Consecutive failures: {fetch_stats['consecutive_failures']}")
+    
+    return None
+
+@tasks.loop(seconds=180)  # Increased from 120 to 180 seconds (3 minutes)
 async def update_bot_status():
-    """Update bot status and channel name"""
+    """Update bot status and channel name with improved error handling"""
     global last_price
     
     if not client.is_ready():
@@ -533,7 +684,13 @@ async def update_bot_status():
         return
     
     try:
-        logger.info("🔄 Starting price update...")
+        logger.info("🔄 Starting price update cycle...")
+        
+        # Add adaptive delay based on consecutive failures
+        if fetch_stats["consecutive_failures"] >= 3:
+            additional_delay = min(fetch_stats["consecutive_failures"] * 30, 300)  # Max 5 min
+            logger.info(f"⏳ Adding {additional_delay}s delay due to {fetch_stats['consecutive_failures']} consecutive failures...")
+            await asyncio.sleep(additional_delay)
         
         # Fetch price in executor to avoid blocking
         loop = asyncio.get_event_loop()
@@ -574,6 +731,10 @@ async def update_bot_status():
         else:
             logger.warning("⏸️ Price fetch failed, will retry next cycle")
             
+            # Consider longer delay if many failures
+            if fetch_stats["consecutive_failures"] >= 5:
+                logger.info("🔄 Many consecutive failures, extending next cycle delay...")
+                
     except Exception as update_error:
         logger.error(f"⚠️ Update cycle error: {update_error}")
 
@@ -611,6 +772,8 @@ async def on_disconnect():
 @client.event
 async def on_resumed():
     logger.info("🔄 Discord reconnected")
+    # Reset consecutive failures on reconnect
+    fetch_stats["consecutive_failures"] = 0
 
 @client.event
 async def on_error(event, *args, **kwargs):
@@ -638,4 +801,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
