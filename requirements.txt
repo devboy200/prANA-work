@@ -1,5 +1,4 @@
-discord.py==2.3.2
-selenium==4.15.2
-requests==2.31.0
-psutil==5.9.6
-python-dotenv==1.0.0
+discord.py
+selenium
+python-dotenv
+webdriver-manager
