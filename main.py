@@ -8,6 +8,8 @@ import requests
 import zipfile
 import stat
 import shutil
+import psutil
+import gc
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
@@ -20,112 +22,30 @@ from discord.ext import tasks
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Environment variables validation with comprehensive debugging
+# Environment variables validation
 def validate_environment():
     """Validate required environment variables"""
-    logger.info("=== COMPREHENSIVE ENVIRONMENT DEBUG ===")
+    logger.info("=== ENVIRONMENT VALIDATION ===")
     
-    # Print ALL environment variables for debugging
-    logger.info("ALL ENVIRONMENT VARIABLES:")
-    env_vars = dict(os.environ)
-    for key in sorted(env_vars.keys()):
-        value = env_vars[key]
-        # Hide sensitive values but show they exist
-        if 'TOKEN' in key.upper() or 'SECRET' in key.upper() or 'KEY' in key.upper():
-            display_value = f"***HIDDEN*** (length: {len(value)})"
-        else:
-            display_value = value
-        logger.info(f"  {key} = {display_value}")
+    discord_token = os.environ.get("DISCORD_BOT_TOKEN")
+    voice_channel_id = os.environ.get("VOICE_CHANNEL_ID")
     
-    logger.info("=" * 50)
-    
-    # Multiple methods to get variables
-    methods = [
-        ("os.environ.get", lambda k: os.environ.get(k)),
-        ("os.getenv", lambda k: os.getenv(k)),
-        ("direct os.environ", lambda k: os.environ[k] if k in os.environ else None),
-    ]
-    
-    discord_token = None
-    voice_channel_id = None
-    
-    for method_name, method_func in methods:
-        logger.info(f"Trying {method_name}:")
-        try:
-            token = method_func("DISCORD_BOT_TOKEN")
-            channel = method_func("VOICE_CHANNEL_ID")
-            logger.info(f"  DISCORD_BOT_TOKEN: {'FOUND' if token else 'NOT FOUND'}")
-            logger.info(f"  VOICE_CHANNEL_ID: {'FOUND' if channel else 'NOT FOUND'}")
-            
-            if token and not discord_token:
-                discord_token = token
-            if channel and not voice_channel_id:
-                voice_channel_id = channel
-                
-        except Exception as e:
-            logger.error(f"  Error with {method_name}: {e}")
-    
-    # Try reading from potential Railway config files
-    potential_files = [
-        "/app/.env",
-        "/etc/environment",
-        "/proc/self/environ"
-    ]
-    
-    for file_path in potential_files:
-        if os.path.exists(file_path):
-            logger.info(f"Found config file: {file_path}")
-            try:
-                with open(file_path, 'r') as f:
-                    content = f.read()
-                    if 'DISCORD_BOT_TOKEN' in content:
-                        logger.info(f"  DISCORD_BOT_TOKEN found in {file_path}")
-                    if 'VOICE_CHANNEL_ID' in content:
-                        logger.info(f"  VOICE_CHANNEL_ID found in {file_path}")
-            except Exception as e:
-                logger.warning(f"  Could not read {file_path}: {e}")
-    
-    # Final validation
     if not discord_token:
-        logger.error("❌ DISCORD_BOT_TOKEN could not be found with any method!")
-        logger.error("🔧 DEBUG STEPS:")
-        logger.error("   1. Check if Railway variables are really set")
-        logger.error("   2. Try deleting and re-adding the variables")
-        logger.error("   3. Make sure you're deploying to the right service/environment")
-        logger.error("   4. Check Railway documentation for environment variable issues")
-        
-        # Last resort: try to find any variable that might be the token
-        logger.info("🔍 Searching for potential token variables:")
-        for key, value in os.environ.items():
-            if len(value) > 50 and ('.' in value or len(value) > 60):  # Token-like pattern
-                logger.info(f"  Potential token found in {key} (length: {len(value)})")
-        
         raise ValueError("DISCORD_BOT_TOKEN environment variable is required")
     
     if not voice_channel_id:
-        logger.error("❌ VOICE_CHANNEL_ID could not be found with any method!")
         raise ValueError("VOICE_CHANNEL_ID environment variable is required")
     
-    # Validate channel ID format
     try:
         voice_channel_id = int(voice_channel_id)
     except ValueError:
-        logger.error(f"❌ VOICE_CHANNEL_ID must be a valid integer. Got: '{voice_channel_id}'")
         raise ValueError("VOICE_CHANNEL_ID must be a valid integer")
     
-    logger.info("✅ Environment variables validated successfully")
-    logger.info(f"✅ Discord token: {discord_token[:10]}...{discord_token[-4:]} (length: {len(discord_token)})")
-    logger.info(f"✅ Voice channel ID: {voice_channel_id}")
-    
+    logger.info("✅ Environment variables validated")
     return discord_token, voice_channel_id
 
-# Validate environment on import
-try:
-    DISCORD_BOT_TOKEN, VOICE_CHANNEL_ID = validate_environment()
-except Exception as e:
-    logger.error(f"❌ Environment validation failed: {e}")
-    logger.error("❌ Bot cannot start without proper environment variables")
-    raise
+# Validate environment
+DISCORD_BOT_TOKEN, VOICE_CHANNEL_ID = validate_environment()
 
 # Setup Discord client
 intents = discord.Intents.default()
@@ -134,24 +54,82 @@ intents.voice_states = True
 client = discord.Client(intents=intents)
 
 last_price = None
+driver_instance = None
+
+def log_system_resources():
+    """Log current system resource usage"""
+    try:
+        memory = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=1)
+        logger.info(f"💾 Memory: {memory.percent:.1f}% used ({memory.used//1024//1024}MB/{memory.total//1024//1024}MB)")
+        logger.info(f"🖥️ CPU: {cpu:.1f}%")
+        
+        # Count Chrome processes
+        chrome_processes = []
+        for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
+            try:
+                if 'chrome' in proc.info['name'].lower() or 'chromium' in proc.info['name'].lower():
+                    chrome_processes.append(proc)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        
+        if chrome_processes:
+            total_chrome_memory = sum(proc.info['memory_info'].rss for proc in chrome_processes)
+            logger.info(f"🌐 Chrome processes: {len(chrome_processes)} (using {total_chrome_memory//1024//1024}MB)")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Resource logging failed: {e}")
+
+def cleanup_chrome_processes():
+    """Aggressively cleanup Chrome processes"""
+    try:
+        logger.info("🧹 Cleaning up Chrome processes...")
+        
+        # Kill any remaining Chrome processes
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                if any(name in proc.info['name'].lower() for name in ['chrome', 'chromium', 'chromedriver']):
+                    logger.info(f"🔪 Killing {proc.info['name']} (PID: {proc.info['pid']})")
+                    proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        
+        # Wait for processes to die
+        time.sleep(2)
+        
+        # Clean up temp directories
+        temp_dirs = ['/tmp/chrome_temp', '/tmp/chromedriver_new', '/tmp/.com.google.Chrome.*']
+        for temp_dir in temp_dirs:
+            if os.path.exists(temp_dir):
+                try:
+                    shutil.rmtree(temp_dir)
+                    logger.info(f"🗑️ Cleaned temp dir: {temp_dir}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to clean {temp_dir}: {e}")
+        
+        # Force garbage collection
+        gc.collect()
+        
+        logger.info("✅ Chrome cleanup complete")
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Chrome cleanup failed: {e}")
 
 def find_chrome_binary():
-    """Find Chrome/Chromium binary location"""
-    # Check if Railway provides a Chrome binary path
+    """Find Chrome binary with Railway optimization"""
+    # Check Railway environment variable first
     railway_chrome = os.environ.get("GOOGLE_CHROME_BIN")
     if railway_chrome and os.path.exists(railway_chrome):
-        logger.info(f"✅ Found Railway Chrome binary: {railway_chrome}")
+        logger.info(f"✅ Using Railway Chrome: {railway_chrome}")
         return railway_chrome
     
+    # Standard paths
     possible_paths = [
-        "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium",
+        "/usr/bin/google-chrome",
         "/usr/bin/chromium-browser",
-        "/snap/bin/chromium",
-        "/usr/bin/chrome",
+        "/usr/bin/chromium",
         "/opt/google/chrome/google-chrome",
-        "/app/.chrome-for-testing/chrome-linux64/chrome"  # Railway buildpack location
     ]
     
     for path in possible_paths:
@@ -160,481 +138,265 @@ def find_chrome_binary():
             return path
     
     logger.error("❌ No Chrome binary found")
-    logger.error("🔧 For Railway deployment, make sure you have Chrome buildpack:")
-    logger.error("   Add this to your Railway service build settings or use a Chrome buildpack")
     return None
 
-def get_chrome_version(chrome_path):
-    """Get Chrome version and extract major version number"""
+def setup_chromedriver():
+    """Setup ChromeDriver with Railway optimization"""
     try:
-        result = subprocess.run([chrome_path, "--version"], 
-                              capture_output=True, text=True, timeout=10)
-        if result.returncode == 0:
-            version_output = result.stdout.strip()
-            logger.info(f"✅ Chrome version: {version_output}")
-            
-            # Extract version number (e.g., "Google Chrome 138.0.7204.183" -> "138.0.7204.183")
-            version_parts = version_output.split()
-            version_number = version_parts[-1]  # Get the last part which should be the version
-            major_version = version_number.split('.')[0]  # Get major version (138)
-            
-            logger.info(f"✅ Chrome major version: {major_version}")
-            return version_number, major_version
-        else:
-            logger.error(f"❌ Failed to get Chrome version: {result.stderr}")
-            return None, None
-    except Exception as e:
-        logger.error(f"❌ Error getting Chrome version: {e}")
-        return None, None
-
-def download_compatible_chromedriver(major_version):
-    """Download ChromeDriver compatible with Chrome version"""
-    try:
-        # Check if Railway provides chromedriver path
+        # Check if Railway provides chromedriver
         railway_chromedriver = os.environ.get("CHROMEDRIVER_PATH")
         if railway_chromedriver and os.path.exists(railway_chromedriver):
             logger.info(f"✅ Using Railway ChromeDriver: {railway_chromedriver}")
             return railway_chromedriver
         
-        # ChromeDriver directory
-        driver_dir = "/tmp/chromedriver_new"
-        driver_path = os.path.join(driver_dir, "chromedriver")
+        # Use system chromedriver if available
+        system_paths = ["/usr/bin/chromedriver", "/usr/local/bin/chromedriver"]
+        for path in system_paths:
+            if os.path.exists(path):
+                logger.info(f"✅ Using system ChromeDriver: {path}")
+                return path
         
-        # Remove old directory if exists
-        if os.path.exists(driver_dir):
-            shutil.rmtree(driver_dir)
-        
-        # Create fresh directory
-        os.makedirs(driver_dir, exist_ok=True)
-        
-        logger.info(f"📥 Downloading ChromeDriver for Chrome {major_version}...")
-        
-        # Chrome 115+ uses new ChromeDriver API
-        if int(major_version) >= 115:
-            try:
-                # Try to get the exact ChromeDriver version for this Chrome version
-                api_url = f"https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_{major_version}"
-                logger.info(f"🔍 Checking API: {api_url}")
-                
-                response = requests.get(api_url, timeout=30)
-                if response.status_code == 200:
-                    driver_version = response.text.strip()
-                    logger.info(f"✅ Found ChromeDriver version: {driver_version}")
-                    download_url = f"https://storage.googleapis.com/chrome-for-testing-public/{driver_version}/linux64/chromedriver-linux64.zip"
-                else:
-                    logger.warning(f"⚠️ API returned {response.status_code}, using fallback version")
-                    # Use a known working version for Chrome 138
-                    if major_version == "138":
-                        driver_version = "138.0.6906.100"
-                    else:
-                        driver_version = f"{major_version}.0.6000.0"
-                    download_url = f"https://storage.googleapis.com/chrome-for-testing-public/{driver_version}/linux64/chromedriver-linux64.zip"
-                    
-            except Exception as e:
-                logger.warning(f"⚠️ New API failed: {e}, using fallback")
-                # Fallback version
-                if major_version == "138":
-                    driver_version = "138.0.6906.100"
-                else:
-                    driver_version = f"{major_version}.0.6000.0"
-                download_url = f"https://storage.googleapis.com/chrome-for-testing-public/{driver_version}/linux64/chromedriver-linux64.zip"
-        else:
-            # Chrome 114 and below use old API
-            api_url = f"https://chromedriver.storage.googleapis.com/LATEST_RELEASE_{major_version}"
-            try:
-                response = requests.get(api_url, timeout=30)
-                if response.status_code == 200:
-                    driver_version = response.text.strip()
-                    download_url = f"https://chromedriver.storage.googleapis.com/{driver_version}/chromedriver_linux64.zip"
-                else:
-                    raise Exception(f"Old API returned status {response.status_code}")
-            except Exception as e:
-                logger.error(f"❌ Failed to get ChromeDriver version for Chrome {major_version}: {e}")
-                return None
-        
-        logger.info(f"📥 Downloading ChromeDriver {driver_version} from: {download_url}")
-        
-        # Download ChromeDriver
-        zip_path = os.path.join(driver_dir, "chromedriver.zip")
-        
-        try:
-            response = requests.get(download_url, timeout=120)
-            response.raise_for_status()
-            
-            with open(zip_path, 'wb') as f:
-                f.write(response.content)
-            
-            logger.info("📂 Extracting ChromeDriver...")
-            
-            # Extract the zip file
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(driver_dir)
-            
-            # Find the chromedriver executable in extracted files
-            chromedriver_found = False
-            for root, dirs, files in os.walk(driver_dir):
-                for file in files:
-                    if file == "chromedriver":
-                        extracted_path = os.path.join(root, file)
-                        # Move to expected location if not already there
-                        if extracted_path != driver_path:
-                            shutil.move(extracted_path, driver_path)
-                        chromedriver_found = True
-                        break
-                if chromedriver_found:
-                    break
-            
-            if not chromedriver_found:
-                logger.error("❌ ChromeDriver executable not found in downloaded files")
-                return None
-            
-            # Make executable
-            os.chmod(driver_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-            
-            # Clean up zip file
-            os.remove(zip_path)
-            
-            # Test the downloaded ChromeDriver
-            logger.info("🧪 Testing downloaded ChromeDriver...")
-            result = subprocess.run([driver_path, "--version"], 
-                                  capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
-                logger.info(f"✅ ChromeDriver working: {result.stdout.strip()}")
-                return driver_path
-            else:
-                logger.error(f"❌ Downloaded ChromeDriver test failed: {result.stderr}")
-                return None
-                
-        except requests.RequestException as e:
-            logger.error(f"❌ Failed to download ChromeDriver: {e}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"❌ ChromeDriver download error: {e}")
+        logger.error("❌ No ChromeDriver found")
         return None
-
-def setup_chromedriver_and_chrome():
-    """Setup ChromeDriver with automatic version matching"""
-    try:
-        # Find Chrome binary
-        chrome_binary = find_chrome_binary()
-        if not chrome_binary:
-            logger.error("❌ Chrome binary not found")
-            return None, None
         
-        # Get Chrome version
-        chrome_version, major_version = get_chrome_version(chrome_binary)
-        if not chrome_version or not major_version:
-            logger.error("❌ Could not determine Chrome version")
-            return None, None
-        
-        # Always download a fresh ChromeDriver to ensure compatibility
-        logger.info("📥 Downloading compatible ChromeDriver...")
-        chromedriver_path = download_compatible_chromedriver(major_version)
-        
-        if not chromedriver_path:
-            logger.error("❌ Could not download compatible ChromeDriver")
-            return None, None
-        
-        logger.info(f"✅ ChromeDriver setup complete: {chromedriver_path}")
-        return chromedriver_path, chrome_binary
-            
     except Exception as e:
         logger.error(f"❌ ChromeDriver setup error: {e}")
-        return None, None
+        return None
 
-def create_chrome_options(chrome_binary):
-    """Create optimized Chrome options for Railway deployment"""
+def create_ultra_lightweight_chrome_options(chrome_binary):
+    """Create extremely lightweight Chrome options for Railway"""
     options = Options()
     
-    # Set binary location
+    # Set binary
     options.binary_location = chrome_binary
     
-    # Essential options for headless operation in containerized environment
-    options.add_argument("--headless=new")  # Use new headless mode
+    # Headless and basic options
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-plugins")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--remote-debugging-port=9222")
     
-    # Railway/Container specific options
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-software-rasterizer")
+    # Extreme memory optimization
+    options.add_argument("--memory-pressure-off")
+    options.add_argument("--max_old_space_size=512")
     options.add_argument("--disable-background-timer-throttling")
     options.add_argument("--disable-backgrounding-occluded-windows")
     options.add_argument("--disable-renderer-backgrounding")
-    options.add_argument("--disable-features=TranslateUI")
+    options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees,VizDisplayCompositor")
+    
+    # Disable everything possible
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-plugins")
+    options.add_argument("--disable-images")
+    options.add_argument("--disable-javascript")  # We'll enable this only if needed
+    options.add_argument("--disable-css")
+    options.add_argument("--disable-web-security")
     options.add_argument("--disable-features=VizDisplayCompositor")
-    options.add_argument("--disable-ipc-flooding-protection")
-    options.add_argument("--memory-pressure-off")
     
-    # Reduce resource usage for Railway
-    options.add_argument("--max_old_space_size=4096")
+    # Minimal window
+    options.add_argument("--window-size=800,600")
     options.add_argument("--disable-logging")
-    options.add_argument("--disable-dev-tools")
-    options.add_argument("--log-level=3")
     options.add_argument("--silent")
+    options.add_argument("--log-level=3")
     
-    # Anti-detection measures
-    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-    options.add_argument("--disable-blink-features=AutomationControlled")
+    # Single process mode to reduce memory
+    options.add_argument("--single-process")
+    options.add_argument("--disable-dev-tools")
+    options.add_argument("--no-zygote")
+    
+    # Custom user data directory
+    temp_dir = "/tmp/chrome_temp"
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir, exist_ok=True)
+    options.add_argument(f"--user-data-dir={temp_dir}")
+    
+    # Anti-detection (minimal)
+    options.add_argument("--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
     
     return options
 
-def fetch_price():
-    """Fetch prANA price from Nirvana Finance"""
-    driver = None
+def fetch_price_with_retry(max_retries=2):
+    """Fetch price with retry logic and aggressive cleanup"""
+    global driver_instance
     
-    try:
-        # Setup ChromeDriver and Chrome
-        chromedriver_path, chrome_binary = setup_chromedriver_and_chrome()
-        if not chromedriver_path or not chrome_binary:
-            logger.error("❌ Chrome/ChromeDriver setup failed")
-            return None
-        
-        # Create Chrome options
-        options = create_chrome_options(chrome_binary)
-        
-        # Create service
-        service = Service(executable_path=chromedriver_path)
-        
-        # Initialize WebDriver
-        logger.info("🚀 Starting Chrome WebDriver...")
-        driver = webdriver.Chrome(service=service, options=options)
-        
-        # Set timeouts
-        driver.set_page_load_timeout(90)
-        driver.implicitly_wait(30)
-        
-        logger.info("🌐 Loading Nirvana Finance realize page...")
-        driver.get("https://mainnet.nirvana.finance/realize")
-        
-        # Wait for page load
-        logger.info("⏳ Waiting for page elements...")
-        wait = WebDriverWait(driver, 90)
-        
-        # Try multiple selectors to find the price
-        selectors_to_try = [
-            ("CLASS_NAME", "DataPoint_dataPointValue__Bzf_E"),
-            ("CSS_SELECTOR", "[class*='DataPoint_dataPointValue']"),
-            ("CSS_SELECTOR", "[class*='dataPointValue']"),
-            ("CSS_SELECTOR", "[data-testid*='price']"),
-            ("CSS_SELECTOR", ".price-value"),
-            ("CSS_SELECTOR", "[class*='price']"),
-            ("XPATH", "//span[contains(@class, 'DataPoint')]"),
-            ("XPATH", "//div[contains(@class, 'DataPoint')]//span"),
-        ]
-        
-        price_text = None
-        successful_selector = None
-        
-        for selector_type, selector in selectors_to_try:
-            try:
-                logger.info(f"🔍 Trying {selector_type}: {selector}")
-                
-                if selector_type == "CLASS_NAME":
-                    element = wait.until(EC.presence_of_element_located((By.CLASS_NAME, selector)))
-                elif selector_type == "CSS_SELECTOR":
-                    element = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, selector)))
-                elif selector_type == "XPATH":
-                    element = wait.until(EC.presence_of_element_located((By.XPATH, selector)))
-                
-                # Wait a bit more for dynamic content
-                time.sleep(5)
-                
-                # Get text content
-                price_text = element.text.strip()
-                logger.info(f"📝 Found text with {selector_type} '{selector}': '{price_text}'")
-                
-                if price_text:
-                    successful_selector = f"{selector_type}: {selector}"
-                    break
-                    
-            except Exception as e:
-                logger.debug(f"⚠️ {selector_type} '{selector}' failed: {e}")
+    for attempt in range(max_retries):
+        driver = None
+        try:
+            logger.info(f"🔄 Price fetch attempt {attempt + 1}/{max_retries}")
+            
+            # Log resources before starting
+            log_system_resources()
+            
+            # Cleanup any existing processes
+            cleanup_chrome_processes()
+            
+            # Setup Chrome
+            chrome_binary = find_chrome_binary()
+            chromedriver_path = setup_chromedriver()
+            
+            if not chrome_binary or not chromedriver_path:
+                logger.error("❌ Chrome setup failed")
                 continue
-        
-        # Process the found price text
-        if price_text:
-            logger.info(f"✅ Price found using {successful_selector}")
             
-            # Clean the price text
-            original_price = price_text
-            cleaned_price = price_text.replace("USDC", "").replace("$", "").replace(",", "").strip()
+            # Create options
+            options = create_ultra_lightweight_chrome_options(chrome_binary)
+            service = Service(executable_path=chromedriver_path)
             
-            logger.info(f"🧹 Cleaned '{original_price}' to '{cleaned_price}'")
+            # Set service timeout
+            service.start_error_message = "ChromeDriver failed to start"
             
-            if cleaned_price:
+            logger.info("🚀 Starting Chrome (ultra-lightweight mode)...")
+            driver = webdriver.Chrome(service=service, options=options)
+            driver_instance = driver
+            
+            # Set aggressive timeouts
+            driver.set_page_load_timeout(30)
+            driver.implicitly_wait(10)
+            
+            logger.info("🌐 Loading Nirvana Finance...")
+            driver.get("https://mainnet.nirvana.finance/realize")
+            
+            # Wait and look for price
+            wait = WebDriverWait(driver, 20)
+            
+            # Try to find price element
+            price_selectors = [
+                (By.CLASS_NAME, "DataPoint_dataPointValue__Bzf_E"),
+                (By.CSS_SELECTOR, "[class*='DataPoint_dataPointValue']"),
+                (By.CSS_SELECTOR, "[class*='dataPointValue']"),
+            ]
+            
+            price_text = None
+            for selector_type, selector in price_selectors:
                 try:
-                    # Validate it's a valid number
-                    price_float = float(cleaned_price)
-                    logger.info(f"✅ Valid price extracted: {cleaned_price} (${price_float:.4f})")
-                    return cleaned_price
-                except ValueError:
-                    logger.warning(f"⚠️ Invalid number format: '{cleaned_price}'")
-                    return None
-            else:
-                logger.warning("⚠️ Price text empty after cleaning")
-                return None
-        else:
-            logger.warning("⚠️ No price found with any selector")
+                    element = wait.until(EC.presence_of_element_located((selector_type, selector)))
+                    time.sleep(3)  # Wait for dynamic content
+                    price_text = element.text.strip()
+                    if price_text:
+                        break
+                except:
+                    continue
             
-            # Debug: take screenshot and log page info
-            try:
-                screenshot_path = "/tmp/debug_screenshot.png"
-                driver.save_screenshot(screenshot_path)
-                logger.info(f"📸 Debug screenshot: {screenshot_path}")
-                
-                # Check if page loaded correctly
-                page_title = driver.title
-                current_url = driver.current_url
-                page_source_length = len(driver.page_source)
-                
-                logger.info(f"📄 Page title: '{page_title}'")
-                logger.info(f"🔗 Current URL: {current_url}")
-                logger.info(f"📊 Page source length: {page_source_length} chars")
-                
-                # Look for any DataPoint mentions in source
-                if "DataPoint" in driver.page_source:
-                    logger.info("✅ Found 'DataPoint' in page source")
-                else:
-                    logger.warning("⚠️ No 'DataPoint' found in page source")
-                
-            except Exception as debug_error:
-                logger.warning(f"⚠️ Debug info failed: {debug_error}")
+            if price_text:
+                # Clean price
+                cleaned_price = price_text.replace("USDC", "").replace("$", "").replace(",", "").strip()
+                if cleaned_price:
+                    try:
+                        float(cleaned_price)  # Validate
+                        logger.info(f"✅ Price found: {cleaned_price}")
+                        return cleaned_price
+                    except ValueError:
+                        logger.warning(f"⚠️ Invalid price format: {cleaned_price}")
             
-            return None
+            logger.warning("⚠️ No valid price found")
             
-    except Exception as e:
-        logger.error(f"❌ Price fetch failed: {str(e)}")
-        logger.error(f"❌ Error type: {type(e).__name__}")
-        return None
-        
-    finally:
-        if driver:
-            try:
-                driver.quit()
-                logger.info("🔄 Chrome WebDriver closed")
-            except Exception as close_error:
-                logger.warning(f"⚠️ Error closing WebDriver: {close_error}")
+        except Exception as e:
+            logger.error(f"❌ Attempt {attempt + 1} failed: {e}")
+            
+        finally:
+            # Aggressive cleanup after each attempt
+            if driver:
+                try:
+                    driver.quit()
+                    driver_instance = None
+                except:
+                    pass
+            
+            cleanup_chrome_processes()
+            time.sleep(5)  # Wait between attempts
+    
+    logger.error("❌ All price fetch attempts failed")
+    return None
 
-@tasks.loop(seconds=120)  # Every 2 minutes
+@tasks.loop(seconds=180)  # Every 3 minutes (less frequent)
 async def update_bot_status():
-    """Update bot status and channel name"""
+    """Update bot status with resource monitoring"""
     global last_price
     
     if not client.is_ready():
-        logger.info("⏳ Bot not ready, skipping update...")
         return
     
     try:
-        logger.info("🔄 Starting price update...")
+        logger.info("🔄 Starting price update cycle...")
+        log_system_resources()
         
-        # Fetch price in executor to avoid blocking
+        # Fetch price in executor
         loop = asyncio.get_event_loop()
-        price = await loop.run_in_executor(None, fetch_price)
+        price = await loop.run_in_executor(None, fetch_price_with_retry)
         
-        if price:
-            if price != last_price:
-                logger.info(f"📈 Price update: {last_price} → {price}")
-                
-                # Update bot status
-                try:
-                    await client.change_presence(activity=discord.Game(name=f"📊prANA Price: ${price}"))
-                    logger.info(f"✅ Bot status updated: 📊prANA Price: ${price}")
-                except Exception as status_error:
-                    logger.error(f"❌ Status update failed: {status_error}")
-                
-                # Update voice channel
-                channel = client.get_channel(VOICE_CHANNEL_ID)
-                if channel and isinstance(channel, discord.VoiceChannel):
-                    try:
-                        channel_name = f"📊prANA Price: ${price}"
-                        await channel.edit(name=channel_name)
-                        logger.info(f"🔁 Channel updated: {channel_name}")
-                        last_price = price
-                    except discord.Forbidden:
-                        logger.error("❌ No permission to edit channel")
-                    except discord.HTTPException as http_error:
-                        if "rate limited" in str(http_error).lower():
-                            logger.warning("⚠️ Rate limited, will retry next cycle")
-                        else:
-                            logger.error(f"❌ Channel edit failed: {http_error}")
-                    except Exception as channel_error:
-                        logger.error(f"❌ Channel update error: {channel_error}")
-                else:
-                    logger.warning(f"⚠️ Channel {VOICE_CHANNEL_ID} not found or invalid")
-            else:
-                logger.info(f"⏸️ Price unchanged: ${price}")
-        else:
-            logger.warning("⏸️ Price fetch failed, will retry next cycle")
+        if price and price != last_price:
+            logger.info(f"📈 Price update: {last_price} → {price}")
             
-    except Exception as update_error:
-        logger.error(f"⚠️ Update cycle error: {update_error}")
+            # Update bot status
+            await client.change_presence(activity=discord.Game(name=f"prANA: ${price}"))
+            
+            # Update voice channel (with rate limit protection)
+            channel = client.get_channel(VOICE_CHANNEL_ID)
+            if channel and isinstance(channel, discord.VoiceChannel):
+                try:
+                    await channel.edit(name=f"prANA: ${price}")
+                    last_price = price
+                    logger.info(f"✅ Updated to: ${price}")
+                except discord.HTTPException as e:
+                    if "rate limited" in str(e).lower():
+                        logger.warning("⚠️ Rate limited, skipping channel update")
+                    else:
+                        raise
+        elif price:
+            logger.info(f"⏸️ Price unchanged: ${price}")
+        else:
+            logger.warning("⚠️ Price fetch failed")
+            
+    except Exception as e:
+        logger.error(f"❌ Update cycle error: {e}")
+    
+    finally:
+        # Always cleanup after update cycle
+        cleanup_chrome_processes()
+        log_system_resources()
 
 @client.event
 async def on_ready():
     """Bot ready event"""
-    logger.info(f"✅ Bot logged in: {client.user}")
-    logger.info(f"🎯 Target channel ID: {VOICE_CHANNEL_ID}")
-    logger.info(f"🏠 Connected to {len(client.guilds)} servers")
+    logger.info(f"✅ Bot ready: {client.user}")
+    logger.info(f"🎯 Target channel: {VOICE_CHANNEL_ID}")
     
-    # Verify target channel
+    # Verify channel
     channel = client.get_channel(VOICE_CHANNEL_ID)
-    if channel:
-        if isinstance(channel, discord.VoiceChannel):
-            logger.info(f"✅ Target channel: '{channel.name}' in '{channel.guild.name}'")
-        else:
-            logger.error(f"❌ Channel {VOICE_CHANNEL_ID} is not a voice channel!")
+    if channel and isinstance(channel, discord.VoiceChannel):
+        logger.info(f"✅ Channel found: '{channel.name}' in '{channel.guild.name}'")
     else:
-        logger.error(f"❌ Channel {VOICE_CHANNEL_ID} not found!")
+        logger.error(f"❌ Invalid channel: {VOICE_CHANNEL_ID}")
     
-    # Test system setup
-    logger.info("🧪 Testing system setup...")
-    chrome_binary = find_chrome_binary()
-    if chrome_binary:
-        get_chrome_version(chrome_binary)
+    # Log initial resources
+    log_system_resources()
     
-    # Start update loop
-    logger.info("🚀 Starting price monitoring...")
+    # Start monitoring
+    logger.info("🚀 Starting price monitoring (every 3 minutes)...")
     update_bot_status.start()
 
 @client.event
 async def on_disconnect():
     logger.warning("⚠️ Discord disconnected")
-
-@client.event
-async def on_resumed():
-    logger.info("🔄 Discord reconnected")
-
-@client.event
-async def on_error(event, *args, **kwargs):
-    logger.error(f"❌ Discord error in {event}")
+    cleanup_chrome_processes()
 
 def main():
-    """Main function"""
+    """Main function with cleanup"""
     logger.info("🚀 prANA Price Bot Starting...")
-    logger.info(f"🐍 Python: {os.sys.version}")
-    logger.info(f"📁 Working dir: {os.getcwd()}")
-    logger.info(f"🚂 Platform: Railway" if "RAILWAY_ENVIRONMENT" in os.environ else "🖥️ Platform: Local")
+    log_system_resources()
     
-    # Environment is already validated during import
-    logger.info("✅ Environment validation passed")
-    
-    # Start bot
     try:
-        logger.info("🤖 Starting Discord bot...")
         client.run(DISCORD_BOT_TOKEN)
     except KeyboardInterrupt:
         logger.info("👋 Bot stopped by user")
-    except Exception as start_error:
-        logger.error(f"❌ Bot start failed: {start_error}")
-        raise
+    except Exception as e:
+        logger.error(f"❌ Bot error: {e}")
+    finally:
+        cleanup_chrome_processes()
+        logger.info("🧹 Final cleanup complete")
 
 if __name__ == "__main__":
     main()
